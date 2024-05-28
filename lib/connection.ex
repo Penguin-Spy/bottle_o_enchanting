@@ -172,7 +172,7 @@ defmodule MC.Connection do
           Logger.info("Ping request packet: #{inspect(packet)}")
           # the rest of the data ("packet") is all of the data we need to send back
           send_packet(state, 1, packet)
-          :done
+          :shutdown
 
         _ ->
           Logger.error("Unexpected packet id #{inspect(packet_id)} in stage #{inspect(stage)}")
@@ -185,10 +185,19 @@ defmodule MC.Connection do
 
   def check_buffer(state) do
     buf = state.buf
-    # Logger.info("check buffer: #{inspect(buf)}")
     # check if there's a VarInt for the packet length
     state =
       case read_varint(buf) do
+        # legacy server list ping (first 3 bytes are 0xFE 0x01 0xFA, gets parsed as a VarInt of 254, rest 0xFA)
+        {:ok, <<0xFA, rest::binary>>, 254} when state.stage == :handshake ->
+          <<_::binary-size(26), client_version, _::binary>> = rest
+          Logger.notice("legacy server list ping from client version #{client_version}")
+          legacy_response = <<0xFF, 0x00, 32>> <> :unicode.characters_to_binary("§1\x00127\x001.20.4\x00woah haiii :3\x000\x000\x00", :utf8, {:utf16, :big})
+          :gen_tcp.send(state.socket, legacy_response)
+          :gen_tcp.shutdown(state.socket, :read_write)
+          %{state | stage: :shutdown}
+
+        # standard data
         {:ok, buf, value} ->
           Logger.info("read varint from start: #{inspect(value)}")
           # if we have received at least all the bytes of this packet
@@ -201,6 +210,7 @@ defmodule MC.Connection do
             check_buffer(state)
           end
 
+        # not enough bytes to read the packet length VarInt yet
         {:end} ->
           state
       end
