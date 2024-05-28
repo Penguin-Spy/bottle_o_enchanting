@@ -1,0 +1,13 @@
+# mix
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+*.ez
+bottle_o_enchanting-*.tar
+/tmp/
+
+erl_crash.dump
+
+notes/
