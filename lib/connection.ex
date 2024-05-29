@@ -147,6 +147,7 @@ defmodule MC.Connection do
     out_packet = calc_varint(packet_id) <> data
     # prefix with packet length
     out_packet = calc_varint(byte_size(out_packet)) <> out_packet
+    Logger.info("sending packet: #{Base.encode16(out_packet)} in stage #{inspect(state.stage)}")
     :gen_tcp.send(state.socket, out_packet)
   end
 
@@ -157,7 +158,8 @@ defmodule MC.Connection do
 
     stage =
       case packet_id do
-        0 when stage == :handshake ->
+        0x00 when stage == :handshake ->
+          # Begin connection (corresponds to "Connecting to the server..." on the client connection screen)
           {packet, protocol_id} = read_varint!(packet)
           {packet, server_addr} = read_string!(packet)
           {packet, server_port} = read_short!(packet)
@@ -169,17 +171,74 @@ defmodule MC.Connection do
             2 -> :login
           end
 
-        0 when stage == :status ->
+        0x00 when stage == :status ->
           Logger.info("Status request packet")
           # packet id 0, string of the server status response
-          send_packet(state, 0, calc_string("{\"version\":{\"name\":\"1.20.4\",\"protocol\":765},\"players\":{\"max\":0,\"online\":2,\"sample\":[{\"name\":\"Penguin_Spy\",\"id\":\"dfbd911d-9775-495e-aac3-efe339db7efd\"}]},\"description\":{\"text\":\"woah haiii :3\"},\"enforcesSecureChat\":false,\"previewsChat\":false,\"preventsChatReports\":true}"))
+          send_packet(state, 0x00, calc_string("{\"version\":{\"name\":\"1.20.4\",\"protocol\":765},\"players\":{\"max\":0,\"online\":2,\"sample\":[{\"name\":\"Penguin_Spy\",\"id\":\"dfbd911d-9775-495e-aac3-efe339db7efd\"}]},\"description\":{\"text\":\"woah haiii :3\"},\"enforcesSecureChat\":false,\"previewsChat\":false,\"preventsChatReports\":true}"))
           :status
 
-        1 when stage == :status ->
+        0x01 when stage == :status ->
           Logger.info("Ping request packet: #{inspect(packet)}")
           # the rest of the data ("packet") is all of the data we need to send back
-          send_packet(state, 1, packet)
+          send_packet(state, 0x01, packet)
           :shutdown
+
+        0x00 when stage == :login ->
+          {packet, username} = read_string!(packet)
+          <<uuid::binary-size(16), _::binary>> = packet
+          Logger.info("Login packet with username #{inspect(username)} and uuid #{inspect(uuid)}")
+          # Send login success (corresponds to "Joining world" on the client connection screen)
+          send_packet(state, 0x02, uuid <> calc_string(username) <> calc_varint(0))
+          :login_wait_ack
+
+        0x03 when stage == :login_wait_ack ->
+          Logger.info("Login ack received")
+          # send registry data
+          # nbt of just the end tag?
+          send_packet(state, 0x05, <<0x0A, 0x00>>)
+          # tell client we're finished with configuration, u can ack when you're done sending stuff
+          send_packet(state, 0x02, <<>>)
+          :configuration
+
+        0x00 when stage == :configuration ->
+          Logger.info("Client configuration info received")
+          stage
+
+        0x01 when stage == :configuration ->
+          {packet, channel} = read_string!(packet)
+          Logger.info("serverbound plugin message in #{inspect(channel)} with data #{inspect(packet)}")
+          stage
+
+        0x02 when stage == :configuration ->
+          Logger.info("Client configuration finish ack received")
+          # login: Entity ID (4), Hardcore? (1),
+          # Dimension Count (VarInt), [would be dimensions],
+          # Max players (VarInt, unused),
+          # View Distance (VarInt),
+          # Simulation Distance (VarInt),
+          # Reduced debug (1), enable respawn screen (1), limited crafting? (1),
+          # starting dimension type (?) (String),
+          # starting dimension name (String),
+          # hashed world seed (8), game mode (1), prev game mode (1), debug? (1), flat? (1), has death location? (1)
+          # portal cooldown (VarInt, unknown use)
+          send_packet(
+            state,
+            0x29,
+            <<0, 0, 0, 0, 1>> <>
+              calc_varint(0) <>
+              calc_varint(0) <>
+              calc_varint(12) <>
+              calc_varint(5) <>
+              <<0, 1, 0>> <>
+              calc_string("minecraft:overworld") <>
+              calc_string("minecraft:overworld") <>
+              <<0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0>> <>
+              calc_varint(0)
+          )
+
+          # this fails because we haven't sent a proper registry
+
+          :play
 
         _ ->
           Logger.error("Unexpected packet id #{inspect(packet_id)} in stage #{inspect(stage)}")
@@ -206,7 +265,6 @@ defmodule MC.Connection do
 
         # standard data
         {:ok, buf, value} ->
-          Logger.info("read varint from start: #{inspect(value)}")
           # if we have received at least all the bytes of this packet
           if(byte_size(buf) >= value) do
             # split out the packet, read it, and return the rest of the buffer
