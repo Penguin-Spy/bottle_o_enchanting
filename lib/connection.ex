@@ -192,10 +192,9 @@ defmodule MC.Connection do
           :login_wait_ack
 
         0x03 when stage == :login_wait_ack ->
-          Logger.info("Login ack received")
+          Logger.info("Login ack received, sending registry and ending configuration")
           # send registry data
-          # nbt of just the end tag?
-          send_packet(state, 0x05, <<0x0A, 0x00>>)
+          send_packet(state, 0x05, MC.Server.get_registry())
           # tell client we're finished with configuration, u can ack when you're done sending stuff
           send_packet(state, 0x02, <<>>)
           :configuration
@@ -206,7 +205,7 @@ defmodule MC.Connection do
 
         0x01 when stage == :configuration ->
           {packet, channel} = read_string!(packet)
-          Logger.info("serverbound plugin message in #{inspect(channel)} with data #{inspect(packet)}")
+          Logger.info("serverbound plugin message (configuration) to #{inspect(channel)} with data #{inspect(packet)}")
           stage
 
         0x02 when stage == :configuration ->
@@ -236,12 +235,32 @@ defmodule MC.Connection do
               calc_varint(0)
           )
 
-          # this fails because we haven't sent a proper registry
-
           :play
 
+        0x10 when stage == :play ->
+          {packet, channel} = read_string!(packet)
+          Logger.info("serverbound plugin message (play) to #{inspect(channel)} with data #{inspect(packet)}")
+          stage
+
+        0x17 when stage == :play ->
+          Logger.info("Set Player Position")
+          stage
+
+        0x18 when stage == :play ->
+          Logger.info("Set Player Position and Rotation")
+          stage
+
+        0x19 when stage == :play ->
+          Logger.info("Set Player Rotation")
+          stage
+
+        0x20 when stage == :play ->
+          <<flags, _::binary>> = packet
+          Logger.info("player abilities: 0b#{Integer.to_string(flags, 2)}")
+          stage
+
         _ ->
-          Logger.error("Unexpected packet id #{inspect(packet_id)} in stage #{inspect(stage)}")
+          Logger.error("Unexpected packet id 0x#{Integer.to_string(packet_id, 16)} in stage #{inspect(stage)}")
           :gen_tcp.shutdown(state.socket, :read_write)
           stage
       end
