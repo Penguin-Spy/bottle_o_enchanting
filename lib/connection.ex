@@ -140,6 +140,79 @@ defmodule MC.Connection do
     {:end}
   end
 
+  def encode_chunk_data_array(entries, bits_per_entry) do
+    # accumulator is {array, buffer, bits used}
+    {array, buffer, bits_used} =
+      Enum.reduce(entries, {<<>>, <<>>, 0}, fn entry, acc ->
+        {array, buffer, bits_used} = acc
+
+        if(bits_used + bits_per_entry < 64) do
+          # have more space still
+          buffer = <<entry::size(bits_per_entry), buffer::bits>>
+          {array, buffer, bits_used + bits_per_entry}
+        else
+          # need to start a new Long
+          array = array <> <<0::size(64 - bits_used), buffer::bits>>
+          buffer = <<entry::size(bits_per_entry)>>
+          {array, buffer, bits_per_entry}
+        end
+      end)
+
+    # finish last Long (if one was started)
+    if bits_used != 0 do
+      array <>
+        <<0::size(64 - bits_used), buffer::bits>>
+    else
+      array
+    end
+  end
+
+  # TODO: input block data
+  def encode_chunk(chunk_x, chunk_z) do
+    # empty heightmaps
+    heightmaps = MC.NBT.encode([])
+
+    # generate chunk data
+    # array of chunk sections (16 of them):
+    #  1 chunk section (subchunk): block count, block states, biomes
+    #  palleted container: bits per entry(1)=0, value(VarInt), data array length(VarInt)=0
+    chunk_data =
+      Enum.reduce(1..16, <<>>, fn item, buf ->
+        block_id =
+          if chunk_x != 0 or chunk_z != 0 do
+            item
+          else
+            0
+          end
+
+        buf <>
+          <<4096::integer-16>> <>
+          <<0, calc_varint(block_id)::binary, calc_varint(0)::binary>> <>
+          <<0, calc_varint(0)::binary, calc_varint(0)::binary>>
+      end)
+
+    # chunk X, Z
+    # heightmaps
+    # chunk data size, chunk data
+    # number of block entities, block entity data (empty)
+    # sky light mask length, sky light mask bits (empty)
+    # block light mask length, block light mask bits (empty)
+    # sky light empty length, bits
+    # block light empty length, bits
+    # sky light data array count
+    # block light data array count
+    <<chunk_x::32-signed, chunk_z::32-signed>> <>
+      heightmaps <>
+      <<calc_varint(byte_size(chunk_data))::binary, chunk_data::binary>> <>
+      calc_varint(0) <>
+      calc_varint(0) <>
+      calc_varint(0) <>
+      calc_varint(0) <>
+      calc_varint(0) <>
+      calc_varint(0) <>
+      calc_varint(0)
+  end
+
   @doc """
     Sends a packet to the client with the specified packet id and data.
   """
@@ -147,13 +220,13 @@ defmodule MC.Connection do
     out_packet = calc_varint(packet_id) <> data
     # prefix with packet length
     out_packet = calc_varint(byte_size(out_packet)) <> out_packet
-    Logger.info("sending packet: #{Base.encode16(out_packet)} in stage #{inspect(state.stage)}")
+    # Logger.info("sending packet: #{Base.encode16(out_packet)} in stage #{inspect(state.stage)}")
     :gen_tcp.send(state.socket, out_packet)
   end
 
   def read_packet(packet, state) do
     stage = state.stage
-    Logger.info("reading packet: #{Base.encode16(packet)} in stage #{inspect(stage)}")
+    # Logger.info("reading packet: #{Base.encode16(packet)} in stage #{inspect(stage)}")
     {packet, packet_id} = read_varint!(packet)
 
     stage =
@@ -187,7 +260,7 @@ defmodule MC.Connection do
           {packet, username} = read_string!(packet)
           <<uuid::binary-size(16), _::binary>> = packet
           Logger.info("Login packet with username #{inspect(username)} and uuid #{inspect(uuid)}")
-          # Send login success (corresponds to "Joining world" on the client connection screen)
+          # Send login success (corresponds to "Joining world..." on the client connection screen)
           send_packet(state, 0x02, uuid <> calc_string(username) <> calc_varint(0))
           :login_wait_ack
 
@@ -210,7 +283,8 @@ defmodule MC.Connection do
 
         0x02 when stage == :configuration ->
           Logger.info("Client configuration finish ack received")
-          # login: Entity ID (4), Hardcore? (1),
+          # Send login (Corresponds to "Loading terrain..." on the client connection screen)
+          # Entity ID (4), Hardcore? (1),
           # Dimension Count (VarInt), [would be dimensions],
           # Max players (VarInt, unused),
           # View Distance (VarInt),
@@ -231,9 +305,24 @@ defmodule MC.Connection do
               <<0, 1, 0>> <>
               calc_string("minecraft:overworld") <>
               calc_string("minecraft:overworld") <>
-              <<0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0>> <>
-              calc_varint(0)
+              <<0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0>> <> calc_varint(0)
           )
+
+          # Game event 13 - start waiting for chunks
+          send_packet(state, 0x20, <<13, 0::float-32>>)
+
+          # send chunks
+          for x <- -2..2 do
+            for z <- -2..2 do
+              send_packet(state, 0x25, encode_chunk(x, z))
+            end
+          end
+
+          # synchronize player position
+          send_packet(state, 0x3E, <<0::float-64, 280::float-64, 0::float-64, 0::float-32, 0::float-32, 0x00, calc_varint(0)::binary>>)
+
+          # begin keepalive
+          :timer.send_after(20_000, {:keepalive})
 
           :play
 
@@ -242,21 +331,41 @@ defmodule MC.Connection do
           Logger.info("serverbound plugin message (play) to #{inspect(channel)} with data #{inspect(packet)}")
           stage
 
+        0x15 when stage == :play ->
+          # TODO: figure out how to keep track of if the client responded to the keepalive
+          # state = %{state | keepalive: true}
+          Logger.debug("received keepalive")
+          :timer.send_after(20_000, {:keepalive})
+          stage
+
         0x17 when stage == :play ->
-          Logger.info("Set Player Position")
+          # Logger.info("Set Player Position")
           stage
 
         0x18 when stage == :play ->
-          Logger.info("Set Player Position and Rotation")
+          # Logger.info("Set Player Position and Rotation")
           stage
 
         0x19 when stage == :play ->
-          Logger.info("Set Player Rotation")
+          # Logger.info("Set Player Rotation")
+          stage
+
+        0x1A when stage == :play ->
+          Logger.info("Set Player On Ground: #{inspect(packet)}")
+          stage
+
+        0x00 when stage == :play ->
+          {_, tp_id} = read_varint!(packet)
+          Logger.info("confirm teleport: #{inspect(tp_id)}")
           stage
 
         0x20 when stage == :play ->
           <<flags, _::binary>> = packet
           Logger.info("player abilities: 0b#{Integer.to_string(flags, 2)}")
+          stage
+
+        0x22 when stage == :play ->
+          Logger.info("Player Command: #{packet}")
           stage
 
         _ ->
@@ -320,6 +429,12 @@ defmodule MC.Connection do
 
   def handle_info({:tcp_error, _socket, reason}, state) do
     Logger.error("tcp error for socket #{inspect(state.socket)}: #{reason}")
+    {:noreply, state}
+  end
+
+  def handle_info({:keepalive}, state) do
+    Logger.debug("sending keepalive")
+    send_packet(state, 0x24, <<0::64>>)
     {:noreply, state}
   end
 end
